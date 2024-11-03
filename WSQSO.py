@@ -1,5 +1,7 @@
 import sys, random, re, configparser, collections, time
 import numpy as np
+from scipy.signal import argrelextrema 
+from scipy.signal import hilbert
 from datetime import datetime
 from PyQt6.QtWidgets import (
 	QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
@@ -7,8 +9,8 @@ from PyQt6.QtWidgets import (
 	QFrame, QCheckBox, QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QComboBox, 
 	QProgressBar
 )
-from PyQt6.QtGui import QAction, QActionGroup, QPainter, QColor, QPen, QImage, QIcon
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QAction, QActionGroup, QPainter, QColor, QPen, QImage, QIcon, QPalette
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSysInfo
 from PyQt6.QtMultimedia import QAudioInput, QAudioFormat, QMediaDevices, QAudioSource
 
 class TimerWorker(QThread):
@@ -99,7 +101,7 @@ class FrequencyScaleWidget(QWidget):
 class WaterfallCanvas(QWidget):
 	def __init__(self, parent=None):
 		super().__init__(parent)
-		self.spectrogram_height = 273
+		self.spectrogram_height = 548
 		self.spectrogram_width = 400
 		self.image = QImage(self.spectrogram_width, self.spectrogram_height, QImage.Format.Format_RGB32)
 		self.image.fill(Qt.GlobalColor.black)  # Remplir l'image avec du noir au démarrage
@@ -145,7 +147,7 @@ class WaterfallCanvas(QWidget):
 			painter.rotate(-90)  # Faire pivoter de 90 degrés vers la gauche
 
 			# Dessiner le texte (à la verticale, aligné sur le bas)
-			painter.drawText(0, -5, current_time)  # Aligner le texte sur le bas
+			painter.drawText(0, 5, current_time)  # Aligner le texte sur le bas
 
 			# Restaurer la transformation originale
 			painter.restore()
@@ -400,7 +402,208 @@ class AudioConfDialog(QDialog):
 			return self.devices[index]
 		return None
 
-class WSPRQSOInterface(QMainWindow):
+class AudioProcessor:
+	def __init__(self, config, canvas):
+		# Chargement de la configuration et du canvas pour l'affichage
+		self.config = config
+		self.canvas = canvas
+		# Initialisation du buffer et taille de la FFT
+		self.fft_size = 65536
+		self.buffer = np.zeros(self.fft_size, dtype=np.int16)
+		
+		# buffer intermediaire pour la taille de l'overlap
+		self.audio_buffer_accumulator = np.array([], dtype=np.int16)
+		self.audio_buffer_accumulator_sub_size = 16384 # 0,341333 entre chaque fft
+		
+	   # Création de la fenêtre sinusoïdale pour le fenêtrage de `self.buffer`
+		#self.window = np.sin(np.pi * np.arange(self.fft_size) / self.fft_size)  # sin(pi * i / 65536)
+		self.window = 0.5 * (1 - np.cos(2 * np.pi * np.arange(self.fft_size) / (self.fft_size - 1)))
+
+		self.reset_buffers()
+
+	def reset_buffers(self):
+		#Création du tableau des données final pour le traitement du décodage soit 512 fréquences de fft sur 375hz et 352 fenetres de 1,3653s d'echantillons sépraré de 0.341s d'interval 
+		self.WSData_buffer = np.zeros((512, 359))  # Tampon circulaire pour les données filtrées WS 512 fréquences pour 359 fft pour les futurs calculs sauf que en réalité nous en aurons que 333 sur 114s
+		self.current_fft_index = 0 
+		self.WSData_buffer_avg = np.zeros(512)
+		self.flag_get_audio_data = 0
+		
+
+	def setup_audio(self):
+		# Arrêter l'audio actuel si nécessaire
+		if hasattr(self, 'audio_source') and self.audio_source:
+			self.audio_source.stop()
+			
+		# Définir le format de l'audio
+		audio_format = QAudioFormat()
+		audio_format.setChannelCount(1)
+		audio_format.setSampleRate(48000)
+		audio_format.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+
+		# Charger l'identifiant du périphérique audio depuis le fichier de configuration s'il n'a pas été déjà défini
+		device_id = self.config.get("Audio", "device_id", fallback=None)
+			
+		# Rechercher le périphérique correspondant ou utiliser celui par défaut
+		devices = QMediaDevices.audioInputs()
+		device = None
+		for d in devices:
+			print(f"{device_id}")
+			print(f"{d.id()} {d.description()}")
+			if str(d.id()) == str(device_id):
+				device = d
+				print("Selected device based on configuration:", d.description())
+				break
+		
+		# Si aucun périphérique correspondant n'est trouvé, utiliser le périphérique par défaut
+		if device is None:
+			device = QMediaDevices.defaultAudioInput()
+			print("No matching device found. Using default audio input:", device.description())
+
+		# Stocker le périphérique sélectionné dans self.audio_device
+		self.audio_device = device
+
+		# Créer QAudioSource avec le périphérique et le format défini
+		self.audio_source = QAudioSource(device, audio_format)
+		self.audio_buffer = self.audio_source.start()
+		self.audio_buffer.readyRead.connect(self.accumulate_samples)
+		
+	def accumulate_samples(self):
+		# Lire toutes les données disponibles dans le tampon audio
+		data = self.audio_buffer.readAll()
+		samples = np.frombuffer(data, dtype=np.int16)
+		
+		# Ajouter les échantillons au tampon accumulateur
+		self.audio_buffer_accumulator = np.append(self.audio_buffer_accumulator, samples)
+		
+		# Traiter par blocs de 16384 échantillons
+		while len(self.audio_buffer_accumulator) >= self.audio_buffer_accumulator_sub_size:
+			# Récupérer exactement 16384 échantillons
+			chunk = self.audio_buffer_accumulator[:self.audio_buffer_accumulator_sub_size]
+			self.audio_buffer_accumulator = self.audio_buffer_accumulator[self.audio_buffer_accumulator_sub_size:]
+			
+			# Appeler process_audio_data avec le bloc de 16384 échantillons
+			self.process_audio_data(chunk)
+
+	def process_audio_data(self, samples):
+		
+		self.buffer = np.roll(self.buffer, -self.audio_buffer_accumulator_sub_size)
+		self.buffer[-self.audio_buffer_accumulator_sub_size:] = samples
+		
+		#A remplacer par FFT inverse!!!!
+		self.analytic_signal = hilbert(samples / 32768.0)
+		
+		windowed_buffer = self.buffer * self.window
+		
+		# Effectuer la FFT avec une taille fixée à `fft_size`
+		fft_result = np.fft.fft(windowed_buffer, n=self.fft_size)
+		freqs = np.fft.fftfreq(self.fft_size, d=1/48000)
+
+		# Filtrer les fréquences entre 1300 et 1700 Hz
+		mask = (freqs >= 1300) & (freqs <= 1700)
+		# S'assurer que le masque a la même taille que fft_result
+		filtered_fft = np.abs(fft_result[mask])
+		# Mettre à jour le graphique avec les nouvelles données FFT
+		self.canvas.update_data(filtered_fft)
+					
+		if self.flag_get_audio_data == 1:
+			# Filtrer les fréquences entre 1312.5 et 1687.5 Hz pour le buffer circulaire
+			#band_center = 1500, bandwidth = 375 => start_frequency = 1312.5 & end_frequency = 1687.5
+			specific_mask = (freqs >= 1313) & (freqs <= 1688)
+			#specific_filtered_fft = np.abs(fft_result[specific_mask])
+			fft_result_masqued = fft_result[specific_mask]
+			specific_filtered_fft = np.real(fft_result_masqued) ** 2 + np.imag(fft_result_masqued) ** 2
+
+			# Ajouter les nouvelles données au buffer circulaire
+			self.WSData_buffer[:, self.current_fft_index] = specific_filtered_fft
+			self.WSData_buffer_avg += specific_filtered_fft
+			
+			self.current_fft_index = self.current_fft_index + 1
+		
+		if self.current_fft_index == 334: #(114s)
+			# Instancier la classe `WSDecode_messages` et démarrer le thread pour afficher les spectres
+			self.ws_decode_thread = WSDecode_messages(self.WSData_buffer,self.WSData_buffer_avg)
+			self.ws_decode_thread.start()
+			self.reset_buffers()
+			
+		
+class Candidate:
+	def __init__(self):
+		self.freq = 0.0
+		self.snr = 0.0
+		self.drift = 0.0
+		self.shift = 0
+		self.sync = 0.0
+
+class WSDecode_messages(QThread):
+	def __init__(self, buffer, buffer_avg):
+		super().__init__()
+		self.buffer = buffer
+		self.buffer_avg = buffer_avg
+			
+	def run(self):
+		
+		#Smooth with 7-point window and limit spectrum to +/-150 Hz
+		# Création de la fenêtre (inutile d'utiliser une boucle pour une fenêtre uniforme)
+		window = np.ones(7)
+		# Calcul de l'indice de départ pour buffer_avg
+		indices = np.arange(411).reshape(-1, 1) + np.arange(-3, 4)  # Crée une matrice des indices pour chaque 'i' et 'j'
+		indices += (256 - 205)  # Applique le décalage sur chaque indice
+		# Récupération des valeurs depuis buffer_avg en utilisant les indices
+		buffer_avg_values = self.buffer_avg[indices]
+		# Application de la fenêtre sur les valeurs récupérées et somme le long de l'axe des 'j'
+		smspec = np.sum(buffer_avg_values * window, axis=1)
+		
+		tmpsort = np.sort(smspec)
+		noise_level = tmpsort[122]
+
+		# Données d'entrée
+		df = 375.0/256.0/2  # Fréquence de résolution
+		snr_scaling_factor = 26.3
+		min_snr = 10 ** (-8.0 / 10.0)  # SNR minimal en dB pour la bande WSPR
+		
+		smspec = smspec / noise_level - 1.0
+		smspec = np.where(smspec < min_snr, 0.1 * min_snr, smspec)
+
+		# Calculer fmin et fmax, en tenant compte de l'erreur de fréquence du cadran
+		fmin = -150  # Erreur de fréquence minimale en Hz
+		fmax = 150   # Erreur de fréquence maximale en Hz
+		
+		# Initialisation d'une liste dynamique pour stocker les candidats
+		candidates = []
+				
+		# Calculer les maxima locaux dans smspec
+		local_maxima_indices = argrelextrema(smspec, np.greater)[0]
+
+		# Créer une liste des candidats à partir des maxima locaux
+		filtered_candidates_indices = [j for j in local_maxima_indices if 1 <= j < 410]
+
+		# Limiter la liste de candidats à un maximum de 200 et les filtrer par fmin et fmax
+		for j in filtered_candidates_indices:
+			candidate_freq = (j - 205) * df
+			if len(candidates) < 200 and fmin <= candidate_freq <= fmax:
+				# Créer un nouveau candidat
+				candidate = Candidate()
+				candidate.freq = candidate_freq
+				candidate.snr = 10 * np.log10(smspec[j]) - snr_scaling_factor
+				candidates.append(candidate)
+
+		# sort sur snr pour trier les candidats par ordre décroissant de snr
+		candidates.sort(key=lambda x: x.snr, reverse=True)
+		
+		maxdrift=2
+		nffts = len(self.buffer)
+
+		print(len(candidates))
+		
+		print("\n\n")
+		# Vérification des valeurs des premiers candidats pour débogage
+		for i in range(min(10, len(candidates))):
+			candidates[i].freq = 1500 + candidates[i].freq
+			print(vars(candidates[i]))
+		print("\n\n")
+			
+
+class WSQSOInterface(QMainWindow):
 	def __init__(self):
 		super().__init__()
 		self.setWindowTitle("WSPRQSO by F4HTB")
@@ -497,7 +700,7 @@ class WSPRQSOInterface(QMainWindow):
 		#########
 		# Waterfall canvas pour afficher les spectres
 		self.canvas = WaterfallCanvas(self)
-		self.canvas.setMinimumSize(400, 273)  # Définir une taille minimale pour garantir la visibilité
+		self.canvas.setMinimumSize(400, 548)  # Définir une taille minimale pour garantir la visibilité
 		#########
 
 		#########
@@ -556,9 +759,11 @@ class WSPRQSOInterface(QMainWindow):
 		#########
 		# Barre de progression pour le temps
 		self.timer_progress = QProgressBar(self)
-		self.timer_progress.setRange(0, 200)  # Plage de 0 à 200 secondes
+		self.timer_progress.setRange(0, 120)  # Plage de 0 à 200 secondes
 		self.timer_progress.setValue(0)  # Valeur initiale
+		self.timer_progress.setStyleSheet("QProgressBar{text-align: right;margin-right: 2em;} QProgressBar::chunk{background-color: #ff5733;text-align: center;}")
 		self.timer_progress.setFormat("%v s")  # Afficher les secondes (0 à 200) suivies de "s"
+		self.timer_progress.setStyleSheet("QProgressBar{text-align: right;margin-right: 2em;} QProgressBar::chunk{background-color: #00b050;text-align: center;}")
 
 		# Layout pour aligner la barre de progression en bas à droite
 		progress_layout = QHBoxLayout()
@@ -608,7 +813,7 @@ class WSPRQSOInterface(QMainWindow):
 		#########
 		# Create the TimerWorker and connect the signal
 		self.timer_worker = TimerWorker()
-		self.timer_worker.time_signal.connect(self.update_progress_bar)
+		self.timer_worker.time_signal.connect(self.update_time_where)
 		self.timer_worker.start()
 		#########
 		
@@ -618,90 +823,22 @@ class WSPRQSOInterface(QMainWindow):
 		self.WSPRcircular_buffer = collections.deque(maxlen=(16440))  # Taille définie pour 2 minutes de données, ajustez selon vos besoins
 		#########
 		
-		#########
-		# Configuration pour l'audio
-		self.setup_audio()
-		#########
+		# #########
+		# # Configuration pour l'audio
+		# # Instancier la classe AudioProcessor avec config et canvas
+		self.audio_processor = AudioProcessor(self.config, self.canvas)
+		# # Appeler setup_audio pour configurer et démarrer l'audio
+		self.audio_processor.setup_audio()
+		# #########
 	
-	def update_progress_bar(self, value):
+	def update_time_where(self, value):
 		self.timer_progress.setValue(value)
 		if value == 0:  # À chaque début de cycle de 200 secondes
+			self.audio_processor.flag_get_audio_data = 1
 			self.canvas.draw_time_marker()
-
-	def setup_audio(self):
-		# Arrêter l'audio actuel si nécessaire
-		if hasattr(self, 'audio_source') and self.audio_source:
-			self.audio_source.stop()
-			
-		# Définir le format de l'audio
-		audio_format = QAudioFormat()
-		audio_format.setSampleRate(48000)
-		audio_format.setChannelCount(1)
-		audio_format.setSampleFormat(QAudioFormat.SampleFormat.Int16)
-
-		# Charger l'identifiant du périphérique audio depuis le fichier de configuration s'il n'a pas été déjà défini
-		device_id = self.config.get("Audio", "device_id", fallback=None)
-			
-		# Rechercher le périphérique correspondant ou utiliser celui par défaut
-		devices = QMediaDevices.audioInputs()
-		device = None
-		for d in devices:
-			print(f"{device_id}")
-			print(f"{d.id()} {d.description()}")
-			if str(d.id()) == str(device_id):
-				device = d
-				print("Selected device based on configuration:", d.description())
-				break
-		
-		# Si aucun périphérique correspondant n'est trouvé, utiliser le périphérique par défaut
-		if device is None:
-			device = QMediaDevices.defaultAudioInput()
-			print("No matching device found. Using default audio input:", device.description())
-
-		# Stocker le périphérique sélectionné dans self.audio_device
-		self.audio_device = device
-
-		# Créer QAudioSource avec le périphérique et le format défini
-		self.audio_source = QAudioSource(device, audio_format)
-		self.audio_buffer = self.audio_source.start()
-		
-		# Utiliser un QTimer pour lire les données de l'audio et effectuer la FFT
-		self.timer = QTimer()
-		self.timer.timeout.connect(self.process_audio_data)
-		self.timer.start(50)  # Intervalle de 50 ms pour lire les données audio
-
-
-
-	def process_audio_data(self):
-		if self.audio_buffer.bytesAvailable() > 0:
-			data = self.audio_buffer.readAll()
-			samples = np.frombuffer(data, dtype=np.int16)
-			if len(samples) > 0:
-				# Définir la taille de la FFT comme la largeur du canvas
-				fft_size = 32768
-				
-				# Si la taille des échantillons est inférieure à la taille de la FFT, remplissez-la avec des zéros
-				if len(samples) < fft_size:
-					samples = np.pad(samples, (0, fft_size - len(samples)), 'constant')
-
-				# Effectuer la FFT avec une taille fixée à `fft_size`
-				fft_result = np.fft.fft(samples, n=fft_size)
-				freqs = np.fft.fftfreq(fft_size, d=1/48000)
-
-				# Filtrer les fréquences entre 1300 et 1700 Hz
-				mask = (freqs >= 1300) & (freqs <= 1700)
-				# S'assurer que le masque a la même taille que fft_result
-				filtered_fft = np.abs(fft_result[mask])
-				# Mettre à jour le graphique avec les nouvelles données FFT
-				self.canvas.update_data(filtered_fft)
-				
-				# Filtrer les fréquences entre 1400 et 1600 Hz pour le buffer circulaire
-				specific_mask = (freqs >= 1400) & (freqs <= 1600)
-				specific_filtered_fft = np.abs(fft_result[specific_mask])
-
-				# Ajouter les nouvelles données au buffer circulaire
-				self.WSPRcircular_buffer.extend(specific_filtered_fft)
-	
+			self.timer_progress.setStyleSheet("QProgressBar{text-align: right;margin-right: 2em;} QProgressBar::chunk{background-color: #00b050;text-align: center;}")
+		if value == 114:
+			self.timer_progress.setStyleSheet("QProgressBar{text-align: right;margin-right: 2em;} QProgressBar::chunk{background-color: #ff5733;text-align: center;}")
 
 	@staticmethod
 	def show_error_message(message):
@@ -786,6 +923,6 @@ class WSPRQSOInterface(QMainWindow):
 		event.accept()
 
 app = QApplication(sys.argv)
-window = WSPRQSOInterface()
+window = WSQSOInterface()
 window.show()
 sys.exit(app.exec())
